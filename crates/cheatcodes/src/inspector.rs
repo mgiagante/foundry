@@ -371,10 +371,13 @@ pub struct Cheatcodes {
     /// execution block environment.
     pub block: Option<BlockEnv>,
 
-    /// Currently active EIP-7702 delegation that will be consumed when building the next
-    /// transaction. Set by `vm.attachDelegation()` and consumed via `.take()` during
+    /// Vector of currently active EIP-7702 delegations that will be consumed when building the
+    /// next transaction. Set by `vm.attachDelegation()` and cleared after
     /// transaction construction.
-    pub active_delegation: Option<SignedAuthorization>,
+    pub active_delegations: Vec<SignedAuthorization>,
+
+    /// Current nonces of the signers of EIP-7702 delegation authorizations.
+    pub signer_nonces: HashMap<Address, u64>,
 
     /// The active EIP-4844 blob that will be attached to the next call.
     pub active_blob_sidecar: Option<BlobTransactionSidecar>,
@@ -517,7 +520,8 @@ impl Cheatcodes {
             labels: config.labels.clone(),
             config,
             block: Default::default(),
-            active_delegation: Default::default(),
+            active_delegations: Default::default(),
+            signer_nonces: Default::default(),
             active_blob_sidecar: Default::default(),
             gas_price: Default::default(),
             pranks: Default::default(),
@@ -1136,8 +1140,8 @@ impl Cheatcodes {
                         ..Default::default()
                     };
 
-                    match (self.active_delegation.take(), self.active_blob_sidecar.take()) {
-                        (Some(_), Some(_)) => {
+                    match (!self.active_delegations.is_empty(), self.active_blob_sidecar.take()) {
+                        (true, Some(_)) => {
                             let msg = "both delegation and blob are active; `attachBlob` and `attachDelegation` are not compatible";
                             return Some(CallOutcome {
                                 result: InterpreterResult {
@@ -1148,18 +1152,22 @@ impl Cheatcodes {
                                 memory_offset: call.return_memory_offset.clone(),
                             });
                         }
-                        (Some(auth_list), None) => {
-                            tx_req.authorization_list = Some(vec![auth_list]);
+                        (true, None) => {
+                            // Add all delegations into `tx_req.authorization_list`.
+                            tx_req.authorization_list = Some(self.active_delegations.clone());
                             tx_req.sidecar = None;
 
-                            // Increment nonce to reflect the signed authorization.
-                            account.info.nonce += 1;
+                            // Increment nonce to reflect all signed authorizations.
+                            account.info.nonce += self.active_delegations.len() as u64;
+
+                            // Clear `active_delegations`, so they don't linger on.
+                            self.active_delegations.clear();
                         }
-                        (None, Some(blob_sidecar)) => {
+                        (false, Some(blob_sidecar)) => {
                             tx_req.set_blob_sidecar(blob_sidecar);
                             tx_req.authorization_list = None;
                         }
-                        (None, None) => {
+                        (false, None) => {
                             tx_req.sidecar = None;
                             tx_req.authorization_list = None;
                         }
@@ -1306,6 +1314,37 @@ impl Cheatcodes {
             Some(storage) => storage.copies.contains_key(address),
             None => false,
         }
+    }
+
+    pub fn add_delegation(
+        &mut self,
+        signed_authorization: SignedAuthorization,
+    ) -> Result<(), String> {
+        // Recover the signer's address
+        let signer = signed_authorization
+            .recover_authority()
+            .map_err(|e| format!("Failed to recover signer: {e}"))?;
+
+        // Extract the nonce from the Authorization
+        let nonce = signed_authorization.inner().nonce();
+
+        // Get the expected nonce for the recovered signer (default to 0 if not present)
+        let expected_nonce = self.signer_nonces.entry(signer).or_insert(0);
+
+        // Validate the nonce
+        if nonce != *expected_nonce {
+            return Err(format!(
+                "Invalid nonce for signer {signer}: expected {expected_nonce}, got {nonce}"
+            ));
+        }
+
+        // Add the authorization to active delegations
+        self.active_delegations.push(signed_authorization);
+
+        // Increment the nonce for the signer
+        *expected_nonce += 1;
+
+        Ok(())
     }
 }
 
@@ -1477,7 +1516,7 @@ impl Inspector<EthEvmContext<&mut dyn DatabaseExt>> for Cheatcodes {
                             outcome.result.result = InstructionResult::Revert;
                             outcome.result.output = error.abi_encode().into();
                         }
-                    }
+                    };
                 } else {
                     // Call didn't revert, reset `assume_no_revert` state.
                     self.assume_no_revert = None;
@@ -1919,7 +1958,7 @@ impl Cheatcodes {
         let (key, target_address) = if interpreter.bytecode.opcode() == op::SLOAD {
             (try_or_return!(interpreter.stack.peek(0)), interpreter.input.target_address)
         } else {
-            return
+            return;
         };
 
         let Some(value) = ecx.sload(target_address, key) else {
